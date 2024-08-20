@@ -1,5 +1,5 @@
 # Tactics
 
 
-## POC For All Malware Tactics That I practice
+## POC For All TTPs That I practice
 ### Process Injection ✅(In Work)
