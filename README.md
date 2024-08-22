@@ -2,4 +2,6 @@
 
 
 ## POC For All TTPs That I practice
-### Process Injection ✅(In Work)
+### Process Injection ✅
+### Process Hollowing ✅
+### Thready Execution Hijacking ✅
